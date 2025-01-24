@@ -10,7 +10,6 @@ A touring complete programming language that translates to assembly
 
 ```bash
 $ python3 c.py fibonacci.tc
-```
 0
 1
 1
