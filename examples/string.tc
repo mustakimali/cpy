@@ -1,0 +1,5 @@
+let greeting = "Hello ";
+let name = "World!\n";
+print(greeting);
+print(name);
+print("Bye...");
