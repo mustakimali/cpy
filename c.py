@@ -1,11 +1,13 @@
+import os
 import sys
 import subprocess
 from llvmlite import ir, binding
 
 TOKENS = {
     'IF': 'if', 'ELSE': 'else', 'WHILE': 'while', 'PRINT': 'print',
-    'LET': 'let', 'LBRACE': '{', 'RBRACE': '}', 'LPAREN': '(',
-    'RPAREN': ')', 'SEMI': ';', 'COMMA': ',', 'ASSIGN': '='
+    'LET': 'let', 'FUNC': 'func', 'RETURN': 'return', 'INCLUDE': 'include',
+    'LBRACE': '{', 'RBRACE': '}', 'LPAREN': '(', 'RPAREN': ')',
+    'SEMI': ';', 'COMMA': ',', 'ASSIGN': '='
 }
 
 def lex(input_str):
@@ -15,6 +17,10 @@ def lex(input_str):
         c = input_str[i]
         if c.isspace():
             i += 1
+        elif c == '#':  # Handle comments
+            # Skip characters until end of line
+            while i < len(input_str) and input_str[i] != '\n':
+                i += 1
         elif c == '"':
             i += 1
             string = []
@@ -91,10 +97,14 @@ class Node:
         self.children = children or []
 
 class Parser:
-    def __init__(self, tokens):
+    def __init__(self, tokens, parent=None, file_dir=""):
         self.tokens = tokens
         self.pos = 0
         self.vars = {}
+        self.functions = parent.functions.copy() if parent else {}
+        self.parent = parent
+        self.included_files = parent.included_files.copy() if parent else set()
+        self.file_dir = file_dir
 
     def peek(self):
         return self.tokens[self.pos][0] if self.pos < len(self.tokens) else None
@@ -110,7 +120,10 @@ class Parser:
         return token
 
     def parse(self):
-        return self.parse_block()
+            nodes = []
+            while not self.eof():
+                nodes.append(self.parse_statement())
+            return Node('BLOCK', children=nodes)
 
     def parse_block(self):
         nodes = []
@@ -120,20 +133,98 @@ class Parser:
 
     def parse_statement(self):
         token_type = self.peek()
-        if token_type == 'LET':
+        if token_type == 'INCLUDE':
+            return self.parse_include()
+        elif token_type == 'LET':
+            return self.parse_var_decl()
+        elif token_type == 'FUNC':
+            return self.parse_function()
+        elif token_type == 'RETURN':
+            return self.parse_return()
+        elif token_type == 'LET':
             return self.parse_var_decl()
         elif token_type == 'WHILE':
             return self.parse_while()
         elif token_type == 'IF':
             return self.parse_if()
         elif token_type == 'PRINT':
-            return self.parse_print()
+            return self.parse_fn_with_one_arg('PRINT')
         elif token_type == 'IDENT' and self.pos+1 < len(self.tokens) and self.tokens[self.pos+1][0] == 'ASSIGN':
             return self.parse_var_assign()
         else:
             expr = self.parse_expression()
             self.consume('SEMI')
             return Node('EXPR_STMT', children=[expr])
+
+    def parse_include(self):
+        self.consume('INCLUDE')
+        filename_token = self.consume('STRING')
+        filename = filename_token[1]
+
+        # Resolve path and check existence
+        full_path = os.path.join(self.file_dir, filename)
+        full_path = os.path.normpath(full_path)
+        abs_path = os.path.abspath(full_path)
+
+        if abs_path in self.included_files:
+            return Node('EMPTY')
+        self.included_files.add(abs_path)
+
+        if not os.path.exists(full_path):
+            raise ValueError(f"Included file not found: {full_path}")
+
+        with open(full_path, 'r') as f:
+            content = f.read()
+
+        included_tokens = lex(content)
+        included_dir = os.path.dirname(full_path)
+        included_parser = Parser(included_tokens, parent=self, file_dir=included_dir)
+        included_ast = included_parser.parse()
+
+        # Merge functions from included file
+        self.functions.update(included_parser.functions)
+
+        return Node('INCLUDE', children=included_ast.children)
+
+    def parse_function(self):
+        self.consume('FUNC')
+        name = self.consume('IDENT')[1]
+
+        # Register function before parsing body for recursion support
+        self.functions[name] = {'params': [], 'body': None}
+
+        self.consume('LPAREN')
+        params = []
+        while self.peek() != 'RPAREN':
+            param = self.consume('IDENT')[1]
+            params.append(param)
+            self.vars[param] = 'int'
+            if self.peek() == 'COMMA':
+                self.consume('COMMA')
+        self.consume('RPAREN')
+
+        self.consume('LBRACE')
+        body = self.parse_block()
+        self.consume('RBRACE')
+
+        # Update function definition with parameters and body
+        self.functions[name] = {
+            'params': params,
+            'body': body,
+            'return_type': 'int'  # Assume all functions return int
+        }
+
+        # Clean up parameters from variable scope
+        for param in params:
+            del self.vars[param]
+
+        return Node('FUNCTION', name, [params, body])
+
+    def parse_return(self):
+        self.consume('RETURN')
+        expr = self.parse_expression()
+        self.consume('SEMI')
+        return Node('RETURN', children=[expr])
 
     def parse_var_decl(self):
         self.consume('LET')
@@ -179,13 +270,13 @@ class Parser:
             self.consume('RBRACE')
         return Node('IF', children=[condition, then_block, else_block])
 
-    def parse_print(self):
-        self.consume('PRINT')
+    def parse_fn_with_one_arg(self, ty):
+        self.consume(ty)
         self.consume('LPAREN')
         arg = self.parse_expression()
         self.consume('RPAREN')
         self.consume('SEMI')
-        return Node('PRINT', children=[arg])
+        return Node(ty, children=[arg])
 
     def parse_expression(self):
         return self.parse_comparison()
@@ -214,20 +305,38 @@ class Parser:
             left = Node('BINOP', op, [left, right])
         return left
 
+    def parse_function_call(self):
+        name = self.consume('IDENT')[1]
+        if name not in self.functions:
+            raise ValueError(f"Undefined function: {name}")
+
+        self.consume('LPAREN')
+        args = []
+        while self.peek() != 'RPAREN':
+            args.append(self.parse_expression())
+            if self.peek() == 'COMMA':
+                self.consume('COMMA')
+        self.consume('RPAREN')
+        return Node('CALL', name, args)
+
     def parse_primary(self):
         token = self.tokens[self.pos]
-        if token[0] == 'NUMBER':
-            self.consume()
-            return Node('NUMBER', token[1])
-        elif token[0] == 'STRING':
-            self.consume()
-            return Node('STRING', token[1])
-        elif token[0] == 'IDENT':
+        if token[0] == 'IDENT':
+            # Check for function call first
+            if self.pos+1 < len(self.tokens) and self.tokens[self.pos+1][0] == 'LPAREN':
+                return self.parse_function_call()
+            # Then check variables
             name = token[1]
             if name not in self.vars:
                 raise ValueError(f"Undefined variable: {name}")
             self.consume()
             return Node('VAR', name)
+        elif token[0] == 'NUMBER':
+            self.consume()
+            return Node('NUMBER', token[1])
+        elif token[0] == 'STRING':
+            self.consume()
+            return Node('STRING', token[1])
         elif token[0] == 'LPAREN':
             self.consume('LPAREN')
             expr = self.parse_expression()
@@ -242,16 +351,18 @@ class LLVMCodeGenerator:
         self.builder = None
         self.func = None
         self.vars = {}
+        self.functions = {}
         self.printf = None
         self.string_counter = 0
-        self.fmt_counter = 0  # Add format string counter
+        self.fmt_counter = 0
+        self.current_function = None
 
         # Initialize LLVM
         binding.initialize()
         binding.initialize_native_target()
         binding.initialize_native_asmprinter()
 
-        # Create global format strings once
+        # Create global format strings
         self.fmt_num = self.create_global_fmt("%d")
         self.fmt_str = self.create_global_fmt("%s")
 
@@ -276,21 +387,85 @@ class LLVMCodeGenerator:
     def generate(self, ast):
         self.declare_printf()
 
-        # Create main function
+        # Process all declarations first (functions and includes)
+        for child in ast.children:
+            if child.type in ['FUNCTION', 'INCLUDE']:
+                self.visit(child)
+
+        # Create main function after processing declarations
         func_type = ir.FunctionType(ir.IntType(32), [])
-        self.func = ir.Function(self.module, func_type, name="main")
-        block = self.func.append_basic_block("entry")
-        self.builder = ir.IRBuilder(block)
+        main_func = ir.Function(self.module, func_type, name="main")
+        self.func = main_func  # Set current function context
+        block = main_func.append_basic_block("entry")
+        builder = ir.IRBuilder(block)
 
-        self.visit(ast)
+        # Process main code with temporary builder
+        old_builder = self.builder
+        self.builder = builder
+        for child in ast.children:
+            if child.type not in ['FUNCTION', 'INCLUDE']:
+                self.visit(child)
+        self.builder = old_builder
 
-        # Return 0 from main
-        self.builder.ret(ir.Constant(ir.IntType(32), 0))
+        # Add return statement
+        builder.ret(ir.Constant(ir.IntType(32), 0))
+        self.func = None  # Reset function context
         return str(self.module)
 
     def visit(self, node):
-        method_name = f'visit_{node.type}'
-        return getattr(self, method_name)(node)
+            method_name = f'visit_{node.type}'
+            return getattr(self, method_name)(node)
+
+    def visit_INCLUDE(self, node):
+        for child in node.children:
+            self.visit(child)
+
+    def visit_FUNCTION(self, node):
+        func_name = node.value
+        params, body = node.children
+        param_types = [ir.IntType(32) for _ in params]
+
+        # Create function in the module
+        func_type = ir.FunctionType(ir.IntType(32), param_types)
+        function = ir.Function(self.module, func_type, name=func_name)
+        self.functions[func_name] = function
+
+        # Create blocks using local builder
+        entry_block = function.append_basic_block("entry")
+        builder = ir.IRBuilder(entry_block)
+
+        # Store parameters
+        old_vars = self.vars.copy()
+        for i, param in enumerate(params):
+            ptr = builder.alloca(ir.IntType(32), name=param)
+            builder.store(function.args[i], ptr)
+            self.vars[param] = ptr
+
+        # Generate body with local builder
+        old_builder = self.builder
+        old_func = self.func  # Save previous function context
+        self.builder = builder
+        self.func = function  # Set current function context
+        self.visit(body)
+        self.builder = old_builder
+        self.func = old_func  # Restore previous function context
+
+        # Add default return if missing
+        if not builder.block.is_terminated:
+            builder.ret(ir.Constant(ir.IntType(32), 0))
+
+        # Restore variables
+        self.vars = old_vars
+
+    def visit_RETURN(self, node):
+        value = self.visit(node.children[0])
+        self.builder.ret(value)
+
+    def visit_CALL(self, node):
+        func_name = node.value
+        args = [self.visit(arg) for arg in node.children]
+        func = self.functions[func_name]
+        return self.builder.call(func, args)
 
     def visit_BLOCK(self, node):
         for child in node.children:
@@ -322,7 +497,8 @@ class LLVMCodeGenerator:
         cond_block = self.func.append_basic_block("condition")
 
         # Initial jump to condition
-        self.builder.branch(cond_block)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(cond_block)
 
         # Condition block
         self.builder.position_at_end(cond_block)
@@ -332,7 +508,8 @@ class LLVMCodeGenerator:
         # Loop block
         self.builder.position_at_end(loop_block)
         self.visit(node.children[1])
-        self.builder.branch(cond_block)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(cond_block)
 
         # After loop block
         self.builder.position_at_end(after_block)
@@ -356,16 +533,19 @@ class LLVMCodeGenerator:
         # Then block
         self.builder.position_at_end(then_bb)
         self.visit(then_block)
-        self.builder.branch(merge_bb)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(merge_bb)
 
         # Else block
         if else_block:
             self.builder.position_at_end(else_bb)
             self.visit(else_block)
-            self.builder.branch(merge_bb)
+            if not self.builder.block.is_terminated:
+                self.builder.branch(merge_bb)
 
-        # Merge block
-        self.builder.position_at_end(merge_bb)
+        # Move to merge block only if needed
+        if not self.builder.block.is_terminated:
+            self.builder.position_at_end(merge_bb)
 
     def visit_PRINT(self, node):
         value = self.visit(node.children[0])
@@ -377,7 +557,7 @@ class LLVMCodeGenerator:
             fmt_ptr = self.builder.bitcast(self.fmt_str, ir.IntType(8).as_pointer())
 
         # Call printf
-        self.builder.call(self.printf, [fmt_ptr, value])
+        self.builder.call(self.printf,   [fmt_ptr, value])
 
     def visit_BINOP(self, node):
         left = self.visit(node.children[0])
@@ -428,11 +608,19 @@ if __name__ == "__main__":
         print("Usage: python compiler.py <source_file>")
         sys.exit(1)
 
+    main_file = sys.argv[1]
+    if not os.path.exists(main_file):
+        print(f"Error: File '{main_file}' not found")
+        sys.exit(1)
+
+    # Get main file's directory
+    main_dir = os.path.dirname(os.path.abspath(main_file))
+
     try:
-        with open(sys.argv[1], 'r') as f:
+        with open(main_file, 'r') as f:
             input_str = f.read()
     except FileNotFoundError:
-        print(f"Error: File '{sys.argv[1]}' not found")
+        print(f"Error: File '{main_file}' not found")
         sys.exit(1)
 
     try:
@@ -442,7 +630,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        parser = Parser(tokens)
+        # Initialize parser with main file's directory
+        parser = Parser(tokens, file_dir=main_dir)
         ast = parser.parse()
     except ValueError as e:
         print(f"Parser error: {e}")

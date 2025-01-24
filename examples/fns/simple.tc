@@ -1,0 +1,9 @@
+func add(a, b) {
+    return a + b;
+}
+
+print(add(5, 3));           # 8
+print("\n");
+let result = add(5, 30);
+print(result);           # 35
+print("\n");
