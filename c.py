@@ -1,5 +1,6 @@
 import sys
 import subprocess
+from llvmlite import ir, binding
 
 TOKENS = {
     'IF': 'if', 'ELSE': 'else', 'WHILE': 'while', 'PRINT': 'print',
@@ -22,7 +23,6 @@ def lex(input_str):
                     i += 1
                     if i >= len(input_str):
                         raise ValueError("Unterminated string")
-                    # Handle escape sequences
                     if input_str[i] == 'n':
                         string.append('\n')
                     elif input_str[i] == 't':
@@ -236,141 +236,192 @@ class Parser:
         else:
             raise ValueError(f"Unexpected token: {token}")
 
-class CodeGenerator:
+class LLVMCodeGenerator:
     def __init__(self):
-        self.asm = []
-        self.label_count = 0
+        self.module = ir.Module()
+        self.builder = None
+        self.func = None
         self.vars = {}
-        self.stack_size = 0
-        self.strings = {}
+        self.printf = None
         self.string_counter = 0
+        self.fmt_counter = 0  # Add format string counter
 
-    def new_label(self):
-        self.label_count += 1
-        return f"L{self.label_count}"
+        # Initialize LLVM
+        binding.initialize()
+        binding.initialize_native_target()
+        binding.initialize_native_asmprinter()
 
-    def new_string_label(self):
-        self.string_counter += 1
-        return f".STR{self.string_counter}"
+        # Create global format strings once
+        self.fmt_num = self.create_global_fmt("%d")
+        self.fmt_str = self.create_global_fmt("%s")
 
-    def generate(self, node):
-        if node.type == 'BLOCK':
-            for child in node.children:
-                self.generate(child)
-        elif node.type == 'VAR_DECL':
-            var_name = node.value
-            expr = node.children[0]
-            if expr.type == 'STRING':
-                label = self.new_string_label()
-                self.strings[label] = expr.value
-                self.asm.append(f"lea {label}(%rip), %rax")
-                self.vars[var_name] = (self.stack_size, 'str')
-            else:
-                self.generate(expr)
-                self.vars[var_name] = (self.stack_size, 'int')
-            self.asm.append(f"mov %rax, -{self.stack_size+8}(%rbp)")
-            self.stack_size += 8
-        elif node.type == 'VAR_ASSIGN':
-            var_name = node.value
-            self.generate(node.children[0])
-            offset, _ = self.vars[var_name]
-            self.asm.append(f"mov %rax, -{offset+8}(%rbp)")
-        elif node.type == 'WHILE':
-            self.generate_while(node)
-        elif node.type == 'IF':
-            self.generate_if(node)
-        elif node.type == 'PRINT':
-            self.generate_print(node)
-        elif node.type == 'EXPR_STMT':
-            self.generate(node.children[0])
-        elif node.type == 'BINOP':
-            self.generate_binop(node)
-        elif node.type == 'NUMBER':
-            self.asm.append(f"mov ${node.value}, %rax")
-        elif node.type == 'VAR':
-            offset, _ = self.vars[node.value]
-            self.asm.append(f"mov -{offset+8}(%rbp), %rax")
+    def create_global_fmt(self, fmt):
+        """Create a global format string with unique name"""
+        self.fmt_counter += 1
+        name = f".fmt{self.fmt_counter}"
+        fmt_val = fmt + '\0'
+        fmt_const = ir.Constant(ir.ArrayType(ir.IntType(8), len(fmt_val)),
+                                bytearray(fmt_val.encode()))
+        global_fmt = ir.GlobalVariable(self.module, fmt_const.type, name=name)
+        global_fmt.linkage = 'internal'
+        global_fmt.global_constant = True
+        global_fmt.initializer = fmt_const
+        return global_fmt
 
-    def generate_while(self, node):
-        cond_label = self.new_label()
-        end_label = self.new_label()
-        self.asm.append(f"{cond_label}:")
-        self.generate(node.children[0])
-        self.asm.append("cmp $0, %rax")
-        self.asm.append(f"je {end_label}")
-        self.generate(node.children[1])
-        self.asm.append(f"jmp {cond_label}")
-        self.asm.append(f"{end_label}:")
+    def declare_printf(self):
+        voidptr_ty = ir.IntType(8).as_pointer()
+        printf_ty = ir.FunctionType(ir.IntType(32), [voidptr_ty], var_arg=True)
+        self.printf = ir.Function(self.module, printf_ty, name="printf")
 
-    def generate_if(self, node):
+    def generate(self, ast):
+        self.declare_printf()
+
+        # Create main function
+        func_type = ir.FunctionType(ir.IntType(32), [])
+        self.func = ir.Function(self.module, func_type, name="main")
+        block = self.func.append_basic_block("entry")
+        self.builder = ir.IRBuilder(block)
+
+        self.visit(ast)
+
+        # Return 0 from main
+        self.builder.ret(ir.Constant(ir.IntType(32), 0))
+        return str(self.module)
+
+    def visit(self, node):
+        method_name = f'visit_{node.type}'
+        return getattr(self, method_name)(node)
+
+    def visit_BLOCK(self, node):
+        for child in node.children:
+            self.visit(child)
+
+    def visit_VAR_DECL(self, node):
+        var_name = node.value
+        expr = self.visit(node.children[0])
+
+        # Allocate space on the stack
+        if isinstance(expr.type, ir.IntType):
+            ptr = self.builder.alloca(expr.type)
+            self.vars[var_name] = ptr
+            self.builder.store(expr, ptr)
+        else:  # String type
+            ptr = self.builder.alloca(expr.type)
+            self.vars[var_name] = ptr
+            self.builder.store(expr, ptr)
+
+    def visit_VAR_ASSIGN(self, node):
+        var_name = node.value
+        expr = self.visit(node.children[0])
+        ptr = self.vars[var_name]
+        self.builder.store(expr, ptr)
+
+    def visit_WHILE(self, node):
+        loop_block = self.func.append_basic_block("loop")
+        after_block = self.func.append_basic_block("after_loop")
+        cond_block = self.func.append_basic_block("condition")
+
+        # Initial jump to condition
+        self.builder.branch(cond_block)
+
+        # Condition block
+        self.builder.position_at_end(cond_block)
+        cond_value = self.visit(node.children[0])
+        self.builder.cbranch(cond_value, loop_block, after_block)
+
+        # Loop block
+        self.builder.position_at_end(loop_block)
+        self.visit(node.children[1])
+        self.builder.branch(cond_block)
+
+        # After loop block
+        self.builder.position_at_end(after_block)
+
+    def visit_IF(self, node):
         condition, then_block, else_block = node.children
-        else_label = self.new_label()
-        end_label = self.new_label()
 
-        self.generate(condition)
-        self.asm.append("cmp $0, %rax")
-        self.asm.append(f"je {else_label if else_block else end_label}")
-        self.generate(then_block)
-        self.asm.append(f"jmp {end_label}")
+        then_bb = self.func.append_basic_block("then")
+        else_bb = self.func.append_basic_block("else") if else_block else None
+        merge_bb = self.func.append_basic_block("merge")
 
+        # Evaluate condition
+        cond_value = self.visit(condition)
+
+        # Create branch
         if else_block:
-            self.asm.append(f"{else_label}:")
-            self.generate(else_block)
+            self.builder.cbranch(cond_value, then_bb, else_bb)
+        else:
+            self.builder.cbranch(cond_value, then_bb, merge_bb)
 
-        self.asm.append(f"{end_label}:")
+        # Then block
+        self.builder.position_at_end(then_bb)
+        self.visit(then_block)
+        self.builder.branch(merge_bb)
 
-    def generate_print(self, node):
-        arg = node.children[0]
-        if arg.type == 'STRING':
-            label = self.new_string_label()
-            self.strings[label] = arg.value
-            self.asm.append(f"lea {label}(%rip), %rsi")
-            self.asm.append("lea .fmt_str(%rip), %rdi")
-        elif arg.type == 'VAR':
-            var_name = arg.value
-            offset, var_type = self.vars[var_name]
-            self.asm.append(f"mov -{offset+8}(%rbp), %rsi")
-            fmt = '.fmt_str' if var_type == 'str' else '.fmt_num'
-            self.asm.append(f"lea {fmt}(%rip), %rdi")
-        self.asm.append("xor %eax, %eax")
-        self.asm.append("call printf@PLT")
+        # Else block
+        if else_block:
+            self.builder.position_at_end(else_bb)
+            self.visit(else_block)
+            self.builder.branch(merge_bb)
 
-    def generate_binop(self, node):
+        # Merge block
+        self.builder.position_at_end(merge_bb)
+
+    def visit_PRINT(self, node):
+        value = self.visit(node.children[0])
+
+        # Get correct format string
+        if isinstance(value.type, ir.IntType):
+            fmt_ptr = self.builder.bitcast(self.fmt_num, ir.IntType(8).as_pointer())
+        else:
+            fmt_ptr = self.builder.bitcast(self.fmt_str, ir.IntType(8).as_pointer())
+
+        # Call printf
+        self.builder.call(self.printf, [fmt_ptr, value])
+
+    def visit_BINOP(self, node):
+        left = self.visit(node.children[0])
+        right = self.visit(node.children[1])
         op = node.value
-        left, right = node.children
-        self.generate(left)
-        self.asm.append("push %rax")
-        self.generate(right)
-        self.asm.append("pop %rcx")
 
-        if op == '+':
-            self.asm.append("add %rcx, %rax")
-        elif op == '-':
-            self.asm.append("sub %rcx, %rax")
-        elif op == '*':
-            self.asm.append("imul %rcx, %rax")
-        elif op == '/':
-            self.asm.append("xor %edx, %edx")
-            self.asm.append("idiv %rcx")
-        elif op in ['==', '!=', '<', '>', '<=', '>=']:
-            self.asm.append("cmp %rax, %rcx")
-            jump_map = {
-                '==': 'je',
-                '!=': 'jne',
-                '<': 'jl',
-                '>': 'jg',
-                '<=': 'jle',
-                '>=': 'jge'
-            }
-            jump_instr = jump_map[op]
-            true_label = self.new_label()
-            end_label = self.new_label()
-            self.asm.append(f"{jump_instr} {true_label}")
-            self.asm.append("mov $0, %rax")
-            self.asm.append(f"jmp {end_label}")
-            self.asm.append(f"{true_label}:")
-            self.asm.append("mov $1, %rax")
-            self.asm.append(f"{end_label}:")
+        if op in ['+', '-', '*', '/']:
+            if op == '+':
+                return self.builder.add(left, right)
+            elif op == '-':
+                return self.builder.sub(left, right)
+            elif op == '*':
+                return self.builder.mul(left, right)
+            elif op == '/':
+                return self.builder.sdiv(left, right)
+        elif op in ['<', '>', '<=', '>=', '==', '!=']:
+            return self.builder.icmp_signed({
+                '<': '<=', '>': '>', '<=': '<=', '>=': '>=',
+                '==': '==', '!=': '!='
+            }[op], left, right)
+        else:
+            raise ValueError(f"Unknown operator {op}")
+
+    def visit_NUMBER(self, node):
+        return ir.Constant(ir.IntType(32), node.value)
+
+    def visit_STRING(self, node):
+        # Generate unique name for each string
+        self.string_counter += 1
+        name = f".str{self.string_counter}"
+
+        # Create global string constant
+        str_val = node.value + '\0'
+        str_const = ir.Constant(ir.ArrayType(ir.IntType(8), len(str_val)),
+                               bytearray(str_val.encode()))
+        global_str = ir.GlobalVariable(self.module, str_const.type, name=name)
+        global_str.linkage = 'internal'
+        global_str.global_constant = True
+        global_str.initializer = str_const
+        return self.builder.bitcast(global_str, ir.IntType(8).as_pointer())
+
+    def visit_VAR(self, node):
+        ptr = self.vars[node.value]
+        return self.builder.load(ptr)
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
@@ -397,32 +448,13 @@ if __name__ == "__main__":
         print(f"Parser error: {e}")
         sys.exit(1)
 
-    generator = CodeGenerator()
-    generator.generate(ast)
+    generator = LLVMCodeGenerator()
+    llvm_ir = generator.generate(ast)
 
-    asm_code = f"""
-    .global main
-    .section .text
-    main:
-        push %rbp
-        mov %rsp, %rbp
-        sub ${generator.stack_size}, %rsp
-        {'\n'.join(generator.asm)}
-        mov %rbp, %rsp
-        pop %rbp
-        ret
-    .section .rodata
-    .fmt_num: .string "%d"
-    .fmt_str: .string "%s"
-    """
-    for label, content in generator.strings.items():
-        escaped = content.replace('"', '\\"').replace('\\', '\\\\')
-        asm_code += f"{label}: .string \"{escaped}\"\n"
+    with open("output.ll", "w") as f:
+        f.write(llvm_ir)
 
-    with open("output.s", "w") as f:
-        f.write(asm_code)
-
-    compile_result = subprocess.run(["gcc", "-no-pie", "output.s", "-o", "output"])
+    compile_result = subprocess.run(["clang", "-Wno-override-module", "output.ll", "-o", "output"])
     if compile_result.returncode == 0:
         print("Output:")
         subprocess.run(["./output"])
