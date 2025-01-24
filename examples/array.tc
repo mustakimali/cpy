@@ -1,0 +1,5 @@
+let name = "World";
+format "Hello, %s!" (name);  # Prints "Hello, World!"
+
+#array numbers = {1, 2, 3};
+#let result = "Numbers: " ++ numbers;
