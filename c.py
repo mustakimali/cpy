@@ -7,7 +7,7 @@ TOKENS = {
     'IF': 'if', 'ELSE': 'else', 'WHILE': 'while', 'PRINT': 'print',
     'LET': 'let', 'FUNC': 'func', 'RETURN': 'return', 'INCLUDE': 'include',
     'LBRACE': '{', 'RBRACE': '}', 'LPAREN': '(', 'RPAREN': ')',
-    'SEMI': ';', 'COMMA': ',', 'ASSIGN': '='
+    'SEMI': ';', 'COMMA': ',', 'ASSIGN': '=', 'READ': 'read'
 }
 
 def lex(input_str):
@@ -17,8 +17,7 @@ def lex(input_str):
         c = input_str[i]
         if c.isspace():
             i += 1
-        elif c == '#':  # Handle comments
-            # Skip characters until end of line
+        elif c == '#':
             while i < len(input_str) and input_str[i] != '\n':
                 i += 1
         elif c == '"':
@@ -120,10 +119,10 @@ class Parser:
         return token
 
     def parse(self):
-            nodes = []
-            while not self.eof():
-                nodes.append(self.parse_statement())
-            return Node('BLOCK', children=nodes)
+        nodes = []
+        while not self.eof():
+            nodes.append(self.parse_statement())
+        return Node('BLOCK', children=nodes)
 
     def parse_block(self):
         nodes = []
@@ -141,8 +140,6 @@ class Parser:
             return self.parse_function()
         elif token_type == 'RETURN':
             return self.parse_return()
-        elif token_type == 'LET':
-            return self.parse_var_decl()
         elif token_type == 'WHILE':
             return self.parse_while()
         elif token_type == 'IF':
@@ -161,7 +158,6 @@ class Parser:
         filename_token = self.consume('STRING')
         filename = filename_token[1]
 
-        # Resolve path and check existence
         full_path = os.path.join(self.file_dir, filename)
         full_path = os.path.normpath(full_path)
         abs_path = os.path.abspath(full_path)
@@ -181,16 +177,13 @@ class Parser:
         included_parser = Parser(included_tokens, parent=self, file_dir=included_dir)
         included_ast = included_parser.parse()
 
-        # Merge functions from included file
         self.functions.update(included_parser.functions)
-
         return Node('INCLUDE', children=included_ast.children)
 
     def parse_function(self):
         self.consume('FUNC')
         name = self.consume('IDENT')[1]
 
-        # Register function before parsing body for recursion support
         self.functions[name] = {'params': [], 'body': None}
 
         self.consume('LPAREN')
@@ -207,14 +200,12 @@ class Parser:
         body = self.parse_block()
         self.consume('RBRACE')
 
-        # Update function definition with parameters and body
         self.functions[name] = {
             'params': params,
             'body': body,
-            'return_type': 'int'  # Assume all functions return int
+            'return_type': 'int'
         }
 
-        # Clean up parameters from variable scope
         for param in params:
             del self.vars[param]
 
@@ -307,7 +298,7 @@ class Parser:
 
     def parse_function_call(self):
         name = self.consume('IDENT')[1]
-        if name not in self.functions:
+        if name != 'read' and name not in self.functions:
             raise ValueError(f"Undefined function: {name}")
 
         self.consume('LPAREN')
@@ -321,11 +312,15 @@ class Parser:
 
     def parse_primary(self):
         token = self.tokens[self.pos]
-        if token[0] == 'IDENT':
-            # Check for function call first
+        if token[0] == 'READ':
+            # Handle read() function call
+            self.consume('READ')
+            self.consume('LPAREN')
+            self.consume('RPAREN')
+            return Node('CALL', 'read', [])
+        elif token[0] == 'IDENT':
             if self.pos+1 < len(self.tokens) and self.tokens[self.pos+1][0] == 'LPAREN':
                 return self.parse_function_call()
-            # Then check variables
             name = token[1]
             if name not in self.vars:
                 raise ValueError(f"Undefined variable: {name}")
@@ -353,21 +348,18 @@ class LLVMCodeGenerator:
         self.vars = {}
         self.functions = {}
         self.printf = None
+        self.scanf = None
         self.string_counter = 0
         self.fmt_counter = 0
-        self.current_function = None
 
-        # Initialize LLVM
         binding.initialize()
         binding.initialize_native_target()
         binding.initialize_native_asmprinter()
 
-        # Create global format strings
         self.fmt_num = self.create_global_fmt("%d")
         self.fmt_str = self.create_global_fmt("%s")
 
     def create_global_fmt(self, fmt):
-        """Create a global format string with unique name"""
         self.fmt_counter += 1
         name = f".fmt{self.fmt_counter}"
         fmt_val = fmt + '\0'
@@ -384,22 +376,27 @@ class LLVMCodeGenerator:
         printf_ty = ir.FunctionType(ir.IntType(32), [voidptr_ty], var_arg=True)
         self.printf = ir.Function(self.module, printf_ty, name="printf")
 
+    def declare_scanf(self):
+        voidptr_ty = ir.IntType(8).as_pointer()
+        scanf_ty = ir.FunctionType(ir.IntType(32), [voidptr_ty], var_arg=True)
+        self.scanf = ir.Function(self.module, scanf_ty, name="scanf")
+
     def generate(self, ast):
         self.declare_printf()
+        self.declare_scanf()
 
-        # Process all declarations first (functions and includes)
         for child in ast.children:
             if child.type in ['FUNCTION', 'INCLUDE']:
                 self.visit(child)
 
-        # Create main function after processing declarations
-        func_type = ir.FunctionType(ir.IntType(32), [])
+        func_type = ir.FunctionType(ir.IntType(32),
+                                   [ir.IntType(32),
+                                    ir.IntType(8).as_pointer().as_pointer()])
         main_func = ir.Function(self.module, func_type, name="main")
-        self.func = main_func  # Set current function context
+        self.func = main_func
         block = main_func.append_basic_block("entry")
         builder = ir.IRBuilder(block)
 
-        # Process main code with temporary builder
         old_builder = self.builder
         self.builder = builder
         for child in ast.children:
@@ -407,14 +404,13 @@ class LLVMCodeGenerator:
                 self.visit(child)
         self.builder = old_builder
 
-        # Add return statement
         builder.ret(ir.Constant(ir.IntType(32), 0))
-        self.func = None  # Reset function context
+        self.func = None
         return str(self.module)
 
     def visit(self, node):
-            method_name = f'visit_{node.type}'
-            return getattr(self, method_name)(node)
+        method_name = f'visit_{node.type}'
+        return getattr(self, method_name)(node)
 
     def visit_INCLUDE(self, node):
         for child in node.children:
@@ -425,36 +421,30 @@ class LLVMCodeGenerator:
         params, body = node.children
         param_types = [ir.IntType(32) for _ in params]
 
-        # Create function in the module
         func_type = ir.FunctionType(ir.IntType(32), param_types)
         function = ir.Function(self.module, func_type, name=func_name)
         self.functions[func_name] = function
 
-        # Create blocks using local builder
         entry_block = function.append_basic_block("entry")
         builder = ir.IRBuilder(entry_block)
 
-        # Store parameters
         old_vars = self.vars.copy()
         for i, param in enumerate(params):
             ptr = builder.alloca(ir.IntType(32), name=param)
             builder.store(function.args[i], ptr)
             self.vars[param] = ptr
 
-        # Generate body with local builder
         old_builder = self.builder
-        old_func = self.func  # Save previous function context
+        old_func = self.func
         self.builder = builder
-        self.func = function  # Set current function context
+        self.func = function
         self.visit(body)
         self.builder = old_builder
-        self.func = old_func  # Restore previous function context
+        self.func = old_func
 
-        # Add default return if missing
         if not builder.block.is_terminated:
             builder.ret(ir.Constant(ir.IntType(32), 0))
 
-        # Restore variables
         self.vars = old_vars
 
     def visit_RETURN(self, node):
@@ -462,10 +452,18 @@ class LLVMCodeGenerator:
         self.builder.ret(value)
 
     def visit_CALL(self, node):
-        func_name = node.value
+        if node.value == 'read':
+            return self.visit_READ(node)
+        func = self.functions[node.value]
         args = [self.visit(arg) for arg in node.children]
-        func = self.functions[func_name]
         return self.builder.call(func, args)
+
+    def visit_READ(self, node):
+        input_ptr = self.builder.alloca(ir.IntType(32))
+        fmt = self.create_global_fmt("%d")
+        fmt_ptr = self.builder.bitcast(fmt, ir.IntType(8).as_pointer())
+        self.builder.call(self.scanf, [fmt_ptr, input_ptr])
+        return self.builder.load(input_ptr)
 
     def visit_BLOCK(self, node):
         for child in node.children:
@@ -474,16 +472,9 @@ class LLVMCodeGenerator:
     def visit_VAR_DECL(self, node):
         var_name = node.value
         expr = self.visit(node.children[0])
-
-        # Allocate space on the stack
-        if isinstance(expr.type, ir.IntType):
-            ptr = self.builder.alloca(expr.type)
-            self.vars[var_name] = ptr
-            self.builder.store(expr, ptr)
-        else:  # String type
-            ptr = self.builder.alloca(expr.type)
-            self.vars[var_name] = ptr
-            self.builder.store(expr, ptr)
+        ptr = self.builder.alloca(expr.type)
+        self.vars[var_name] = ptr
+        self.builder.store(expr, ptr)
 
     def visit_VAR_ASSIGN(self, node):
         var_name = node.value
@@ -496,22 +487,18 @@ class LLVMCodeGenerator:
         after_block = self.func.append_basic_block("after_loop")
         cond_block = self.func.append_basic_block("condition")
 
-        # Initial jump to condition
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
-        # Condition block
         self.builder.position_at_end(cond_block)
         cond_value = self.visit(node.children[0])
         self.builder.cbranch(cond_value, loop_block, after_block)
 
-        # Loop block
         self.builder.position_at_end(loop_block)
         self.visit(node.children[1])
         if not self.builder.block.is_terminated:
             self.builder.branch(cond_block)
 
-        # After loop block
         self.builder.position_at_end(after_block)
 
     def visit_IF(self, node):
@@ -521,43 +508,34 @@ class LLVMCodeGenerator:
         else_bb = self.func.append_basic_block("else") if else_block else None
         merge_bb = self.func.append_basic_block("merge")
 
-        # Evaluate condition
         cond_value = self.visit(condition)
 
-        # Create branch
         if else_block:
             self.builder.cbranch(cond_value, then_bb, else_bb)
         else:
             self.builder.cbranch(cond_value, then_bb, merge_bb)
 
-        # Then block
         self.builder.position_at_end(then_bb)
         self.visit(then_block)
         if not self.builder.block.is_terminated:
             self.builder.branch(merge_bb)
 
-        # Else block
         if else_block:
             self.builder.position_at_end(else_bb)
             self.visit(else_block)
             if not self.builder.block.is_terminated:
                 self.builder.branch(merge_bb)
 
-        # Move to merge block only if needed
         if not self.builder.block.is_terminated:
             self.builder.position_at_end(merge_bb)
 
     def visit_PRINT(self, node):
         value = self.visit(node.children[0])
-
-        # Get correct format string
         if isinstance(value.type, ir.IntType):
             fmt_ptr = self.builder.bitcast(self.fmt_num, ir.IntType(8).as_pointer())
         else:
             fmt_ptr = self.builder.bitcast(self.fmt_str, ir.IntType(8).as_pointer())
-
-        # Call printf
-        self.builder.call(self.printf,   [fmt_ptr, value])
+        self.builder.call(self.printf, [fmt_ptr, value])
 
     def visit_BINOP(self, node):
         left = self.visit(node.children[0])
@@ -585,11 +563,8 @@ class LLVMCodeGenerator:
         return ir.Constant(ir.IntType(32), node.value)
 
     def visit_STRING(self, node):
-        # Generate unique name for each string
         self.string_counter += 1
         name = f".str{self.string_counter}"
-
-        # Create global string constant
         str_val = node.value + '\0'
         str_const = ir.Constant(ir.ArrayType(ir.IntType(8), len(str_val)),
                                bytearray(str_val.encode()))
@@ -613,7 +588,6 @@ if __name__ == "__main__":
         print(f"Error: File '{main_file}' not found")
         sys.exit(1)
 
-    # Get main file's directory
     main_dir = os.path.dirname(os.path.abspath(main_file))
 
     try:
@@ -630,7 +604,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        # Initialize parser with main file's directory
         parser = Parser(tokens, file_dir=main_dir)
         ast = parser.parse()
     except ValueError as e:

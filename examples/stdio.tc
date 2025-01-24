@@ -1,0 +1,8 @@
+# Read from stdin
+print("Enter number 1: ");
+let num1 = read();
+print("Enter number 2: ");
+let num2 = read();
+
+print("\nSum of two are: ");
+print(num1 + num2);
