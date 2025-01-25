@@ -5,11 +5,13 @@ on: [push]
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.8", "3.9", "3.10"]
     steps:
-    - uses: actions/checkout@v4
-    - name: Test example files
-      run: |
-        ./test.sh
+      - uses: actions/checkout@v4
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv init && uv pip install -r requirements.txt
+      - name: Test example files
+        run: |
+          ./test.sh
