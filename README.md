@@ -1,6 +1,6 @@
 # cpy
 
-A touring complete programming language that translates to assembly
+A touring complete programming language that compiles to native code using LLVM (originally using assembly)
 
 ## Usage
 
@@ -9,7 +9,7 @@ A touring complete programming language that translates to assembly
 
 
 ```bash
-$ python3 c.py fibonacci.tc
+$ python3 c.py examples/fibonacci.tc
 0
 1
 1
