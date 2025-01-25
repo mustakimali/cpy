@@ -1,7 +1,7 @@
 [project]
-name = "tinycompiler"
+name = "cpy"
 version = "0.1.0"
-description = "Add your description here"
+description = "A touring complete programming language that compiles to native code using LLVM (originally using assembly)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
