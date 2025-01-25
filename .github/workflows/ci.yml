@@ -1,4 +1,4 @@
-name: Pylint
+name: test
 
 on: [push]
 
@@ -11,7 +11,7 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
       - name: Set up Python ${{ matrix.python-version }}
-        run: uv init && uv pip install -r requirements.txt
+        run: uv pip install -r requirements.txt
       - name: Test example files
         run: |
           ./test.sh
