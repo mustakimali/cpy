@@ -7,7 +7,8 @@ TOKENS = {
     'IF': 'if', 'ELSE': 'else', 'WHILE': 'while', 'PRINT': 'print',
     'LET': 'let', 'FUNC': 'func', 'RETURN': 'return', 'INCLUDE': 'include',
     'LBRACE': '{', 'RBRACE': '}', 'LPAREN': '(', 'RPAREN': ')',
-    'SEMI': ';', 'COMMA': ',', 'ASSIGN': '=', 'READ': 'read'
+    'SEMI': ';', 'COMMA': ',', 'ASSIGN': '=', 'READ': 'read',
+    'ARRAY': 'array', 'CONCAT': '++', 'FORMAT': 'format'
 }
 
 def lex(input_str):
@@ -62,8 +63,11 @@ def lex(input_str):
                 tokens.append((ident.upper(), ident))
             else:
                 tokens.append(('IDENT', ident))
-        elif c in '+-*/(){};,<>=!':
-            if c == '=' and i+1 < len(input_str) and input_str[i+1] == '=':
+        elif c in '+-*/(){};,<>=!+':
+            if c == '+' and i+1 < len(input_str) and input_str[i+1] == '+':
+                tokens.append(('CONCAT', '++'))
+                i += 2
+            elif c == '=' and i+1 < len(input_str) and input_str[i+1] == '=':
                 tokens.append(('OP', '=='))
                 i += 2
             elif c == '!' and i+1 < len(input_str) and input_str[i+1] == '=':
@@ -94,9 +98,11 @@ class Node:
         self.type = type
         self.value = value
         self.children = children or []
+        self.data_type = None
 
 class Parser:
     def __init__(self, tokens, parent=None, file_dir=""):
+        super().__init__()
         self.tokens = tokens
         self.pos = 0
         self.vars = {}
@@ -132,7 +138,11 @@ class Parser:
 
     def parse_statement(self):
         token_type = self.peek()
-        if token_type == 'INCLUDE':
+        if token_type == 'ARRAY':
+             return self.parse_array_decl()
+        elif token_type == 'FORMAT':
+             return self.parse_format_string()
+        elif token_type == 'INCLUDE':
             return self.parse_include()
         elif token_type == 'LET':
             return self.parse_var_decl()
@@ -152,6 +162,38 @@ class Parser:
             expr = self.parse_expression()
             self.consume('SEMI')
             return Node('EXPR_STMT', children=[expr])
+
+    def parse_array_decl(self):
+        self.consume('ARRAY')
+        name = self.consume('IDENT')[1]
+        self.consume('ASSIGN')
+        elements = []
+        self.consume('LBRACE')
+        while self.peek() != 'RBRACE':
+            elements.append(self.parse_expression())
+            if self.peek() == 'COMMA':
+                self.consume('COMMA')
+        self.consume('RBRACE')
+        self.consume('SEMI')
+
+        array_node = Node('ARRAY', name, elements)
+        array_node.data_type = 'array'
+        self.vars[name] = array_node
+        return array_node
+
+    def parse_format_string(self):
+        self.consume('FORMAT')
+        format_str = self.consume('STRING')[1]
+        self.consume('LPAREN')
+        args = []
+        while self.peek() != 'RPAREN':
+            args.append(self.parse_expression())
+            if self.peek() == 'COMMA':
+                self.consume('COMMA')
+        self.consume('RPAREN')
+        self.consume('SEMI')
+
+        return Node('FORMAT', format_str, args)
 
     def parse_include(self):
         self.consume('INCLUDE')
@@ -270,7 +312,13 @@ class Parser:
         return Node(ty, children=[arg])
 
     def parse_expression(self):
-        return self.parse_comparison()
+        # Add string concatenation
+        left = self.parse_comparison()
+        if self.peek() == 'CONCAT':
+            self.consume('CONCAT')
+            right = self.parse_comparison()
+            return Node('CONCAT', '++', [left, right])
+        return left
 
     def parse_comparison(self):
         left = self.parse_add_sub()
@@ -348,7 +396,7 @@ class LLVMCodeGenerator:
         self.vars = {}
         self.functions = {}
         self.printf = None
-        self.scanf = None
+        self.snprintf = None
         self.string_counter = 0
         self.fmt_counter = 0
 
@@ -358,6 +406,14 @@ class LLVMCodeGenerator:
 
         self.fmt_num = self.create_global_fmt("%d")
         self.fmt_str = self.create_global_fmt("%s")
+        self.fmt_format = self.create_global_fmt("%s")
+
+    def declare_snprintf(self):
+        voidptr_ty = ir.IntType(8).as_pointer()
+        snprintf_ty = ir.FunctionType(ir.IntType(32),
+            [voidptr_ty, ir.IntType(64), voidptr_ty], var_arg=True)
+        self.snprintf = ir.Function(self.module, snprintf_ty, name="snprintf")
+
 
     def create_global_fmt(self, fmt):
         self.fmt_counter += 1
@@ -371,46 +427,138 @@ class LLVMCodeGenerator:
         global_fmt.initializer = fmt_const
         return global_fmt
 
-    def declare_printf(self):
+    def declare_libraries(self):
+        # Declare all library functions once
         voidptr_ty = ir.IntType(8).as_pointer()
+
+        # Printf
         printf_ty = ir.FunctionType(ir.IntType(32), [voidptr_ty], var_arg=True)
         self.printf = ir.Function(self.module, printf_ty, name="printf")
 
-    def declare_scanf(self):
-        voidptr_ty = ir.IntType(8).as_pointer()
-        scanf_ty = ir.FunctionType(ir.IntType(32), [voidptr_ty], var_arg=True)
-        self.scanf = ir.Function(self.module, scanf_ty, name="scanf")
+        # Snprintf
+        snprintf_ty = ir.FunctionType(ir.IntType(32),
+            [voidptr_ty, ir.IntType(64), voidptr_ty], var_arg=True)
+        self.snprintf = ir.Function(self.module, snprintf_ty, name="snprintf")
 
     def generate(self, ast):
-        self.declare_printf()
-        self.declare_scanf()
+        # Declare standard library functions
+        self.declare_libraries()
 
+        # Process function and include declarations first
         for child in ast.children:
             if child.type in ['FUNCTION', 'INCLUDE']:
                 self.visit(child)
 
+        # Create main function with argc and argv
         func_type = ir.FunctionType(ir.IntType(32),
-                                   [ir.IntType(32),
+                                [ir.IntType(32),
                                     ir.IntType(8).as_pointer().as_pointer()])
         main_func = ir.Function(self.module, func_type, name="main")
-        self.func = main_func
+
+        # Create entry block for main function
         block = main_func.append_basic_block("entry")
         builder = ir.IRBuilder(block)
 
+        # Create pointers for argc and argv
+        argc_ptr = builder.alloca(ir.IntType(32), name="argc")
+        argv_ptr = builder.alloca(ir.IntType(8).as_pointer().as_pointer(), name="argv")
+
+        # Store argc and argv arguments
+        builder.store(main_func.args[0], argc_ptr)
+        builder.store(main_func.args[1], argv_ptr)
+
+        # Add argc and argv to accessible variables
+        old_vars = self.vars.copy()
+        self.vars['argc'] = argc_ptr
+        self.vars['argv'] = argv_ptr
+
+        # Set up builder and function context
         old_builder = self.builder
+        old_func = self.func
         self.builder = builder
+        self.func = main_func
+
+        # Process all non-function statements in the AST
         for child in ast.children:
             if child.type not in ['FUNCTION', 'INCLUDE']:
                 self.visit(child)
-        self.builder = old_builder
 
+        # Restore previous context
+        self.builder = old_builder
+        self.func = old_func
+        self.vars = old_vars
+
+        # Return from main function
         builder.ret(ir.Constant(ir.IntType(32), 0))
-        self.func = None
+
         return str(self.module)
 
     def visit(self, node):
         method_name = f'visit_{node.type}'
         return getattr(self, method_name)(node)
+
+    def visit_ARRAY(self, node):
+        element_type = ir.IntType(32)
+        array_type = ir.ArrayType(element_type, len(node.children))
+        array_ptr = self.builder.alloca(array_type, name=node.value)
+
+        for i, elem in enumerate(node.children):
+            elem_value = self.visit(elem)
+            ptr = self.builder.gep(array_ptr, [
+                ir.Constant(ir.IntType(32), 0),
+                ir.Constant(ir.IntType(32), i)
+            ])
+            self.builder.store(elem_value, ptr)
+
+        self.vars[node.value] = array_ptr
+        return array_ptr
+
+    def visit_CONCAT(self, node):
+        left = self.visit(node.children[0])
+        right = self.visit(node.children[1])
+
+        # Allocate buffer for concatenated string
+        buffer_size = 256  # Fixed buffer size for simplicity
+        buffer_ptr = self.builder.alloca(ir.ArrayType(ir.IntType(8), buffer_size))
+
+        # Call snprintf to concatenate strings
+        fmt_str_ptr = self.create_global_fmt("%s%s")
+        fmt_ptr = self.builder.bitcast(fmt_str_ptr, ir.IntType(8).as_pointer())
+
+        self.declare_snprintf()
+        self.builder.call(self.snprintf, [
+            self.builder.bitcast(buffer_ptr, ir.IntType(8).as_pointer()),
+            ir.Constant(ir.IntType(64), buffer_size),
+            fmt_ptr,
+            left,
+            right
+        ])
+
+        return self.builder.bitcast(buffer_ptr, ir.IntType(8).as_pointer())
+
+    def visit_FORMAT(self, node):
+        format_str = node.value
+        args = [self.visit(arg) for arg in node.children]
+
+        # Allocate buffer for formatted string
+        buffer_size = 256  # Fixed buffer size for simplicity
+        buffer_ptr = self.builder.alloca(ir.ArrayType(ir.IntType(8), buffer_size))
+
+        # Create format string global variable
+        fmt_str_ptr = self.create_global_fmt(format_str)
+        fmt_ptr = self.builder.bitcast(fmt_str_ptr, ir.IntType(8).as_pointer())
+
+        # Declare and call snprintf
+        self.declare_snprintf()
+        format_args = [
+            self.builder.bitcast(buffer_ptr, ir.IntType(8).as_pointer()),
+            ir.Constant(ir.IntType(64), buffer_size),
+            fmt_ptr
+        ] + args
+
+        self.builder.call(self.snprintf, format_args)
+
+        return self.builder.bitcast(buffer_ptr, ir.IntType(8).as_pointer())
 
     def visit_INCLUDE(self, node):
         for child in node.children:
@@ -618,7 +766,6 @@ if __name__ == "__main__":
 
     compile_result = subprocess.run(["clang", "-Wno-override-module", "output.ll", "-o", "output"])
     if compile_result.returncode == 0:
-        print("Output:")
         subprocess.run(["./output"])
     else:
         print("Compilation failed")
